@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mobile Camera Stream</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #222;
+            color: white;
+        }
+        #video {
+            width: 100%;
+            max-width: 400px;
+            background: black;
+            border-radius: 8px;
+            transform: scaleX(-1);
+        }
+        #status {
+            margin: 20px 0;
+            padding: 10px;
+            background: #333;
+            border-radius: 4px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            background: #0078d4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background: #005a9e;
+        }
+        .controls {
+            margin: 20px 0;
+            padding: 15px;
+            background: #333;
+            border-radius: 4px;
+        }
+        .control-group {
+            margin: 10px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        select {
+            padding: 8px;
+            font-size: 16px;
+            border-radius: 4px;
+            border: none;
+            background: #444;
+            color: white;
+            width: 100%;
+            max-width: 200px;
+        }
+        .flip-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .flip-button {
+            flex: 1;
+            padding: 10px;
+            background: #555;
+        }
+        .flip-button.active {
+            background: #0078d4;
+        }
+    </style>
+</head>
+<body>
+    <h1>Mobile Camera Stream</h1>
+    <video id="video" autoplay playsinline></video>
+    <div id="status">Status: Disconnected</div>
+    <button onclick="startStream()">Start Stream</button>
+    <button onclick="stopStream()">Stop Stream</button>
+    
+    <div class="controls" id="controls" style="display: none;">
+        <div class="control-group">
+            <label for="rotation">Rotation:</label>
+            <select id="rotation" onchange="updateRotation()">
+                <option value="0">0°</option>
+                <option value="90">90°</option>
+                <option value="180">180°</option>
+                <option value="270">270°</option>
+            </select>
+        </div>
+        <div class="control-group">
+            <label>Flip:</label>
+            <div class="flip-buttons">
+                <button id="flipH" class="flip-button" onclick="toggleFlip('H')">Flip Horizontal</button>
+                <button id="flipV" class="flip-button" onclick="toggleFlip('V')">Flip Vertical</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let canvas = document.createElement('canvas');
+        let ctx = canvas.getContext('2d');
+        let video = document.getElementById('video');
+        let statusDiv = document.getElementById('status');
+        
+        // Rotation and flip state
+        let rotation = 0;
+        let flipH = false;
+        let flipV = false;
+
+        async function startStream() {
+            const SERVER_IP = prompt("Enter PC IP (e.g., 192.168.1.100):", "10.25.94.185");
+            if (!SERVER_IP) return;
+
+            try {
+                // Get camera access with flexible constraints
+                // This allows the camera to provide its natural resolution
+                // which will adapt to device orientation
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        facingMode: 'user',
+                        width: { ideal: 1920, min: 640 },
+                        height: { ideal: 1080, min: 480 }
+                    },
+                    audio: false
+                });
+                video.srcObject = stream;
+
+                // Wait for video to load
+                await new Promise(resolve => {
+                    video.onloadedmetadata = resolve;
+                });
+
+                // Set canvas size to match actual video dimensions
+                // This adapts to device orientation automatically
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                
+                // Listen for orientation changes and update canvas size
+                video.addEventListener('resize', () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                });
+
+                // Connect to WebSocket (use wss:// for secure)
+                ws = new WebSocket(`wss://${SERVER_IP}:8081`);
+                
+                ws.onopen = () => {
+                    statusDiv.textContent = `Status: Connected to ${SERVER_IP}:8081`;
+                    document.getElementById('controls').style.display = 'block';
+                    // Send initial rotation/flip settings
+                    sendRotationCommand();
+                    sendFlipCommand('H', flipH);
+                    sendFlipCommand('V', flipV);
+                    streamFrames();
+                };
+
+                ws.onerror = (error) => {
+                    statusDiv.textContent = `Status: Connection Error - ${error}`;
+                };
+
+                ws.onclose = () => {
+                    statusDiv.textContent = "Status: Disconnected";
+                };
+
+            } catch (error) {
+                statusDiv.textContent = `Status: Error - ${error.message}`;
+            }
+        }
+
+        function streamFrames() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            // Update canvas size if video dimensions changed (orientation change)
+            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+            }
+
+            // Draw video frame to canvas at actual dimensions
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+            // Convert canvas to blob and send
+            canvas.toBlob((blob) => {
+                ws.send(blob);
+                // Send next frame at ~30 FPS
+                setTimeout(streamFrames, 33);
+            }, 'image/jpeg', 0.8);
+        }
+
+        function stopStream() {
+            if (ws) {
+                ws.close();
+            }
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+            }
+            statusDiv.textContent = "Status: Stopped";
+            document.getElementById('controls').style.display = 'none';
+        }
+        
+        function updateRotation() {
+            rotation = parseInt(document.getElementById('rotation').value);
+            sendRotationCommand();
+        }
+        
+        function sendRotationCommand() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const cmd = JSON.stringify({ action: "rotate", value: rotation });
+                ws.send(cmd);
+            }
+        }
+        
+        function toggleFlip(type) {
+            if (type === 'H') {
+                flipH = !flipH;
+                const button = document.getElementById('flipH');
+                if (flipH) {
+                    button.classList.add('active');
+                } else {
+                    button.classList.remove('active');
+                }
+            } else if (type === 'V') {
+                flipV = !flipV;
+                const button = document.getElementById('flipV');
+                if (flipV) {
+                    button.classList.add('active');
+                } else {
+                    button.classList.remove('active');
+                }
+            }
+            sendFlipCommand(type, type === 'H' ? flipH : flipV);
+        }
+        
+        function sendFlipCommand(type, value) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const cmd = JSON.stringify({ action: "flip", type: type, value: value });
+                ws.send(cmd);
+            }
+        }
+    </script>
+</body>
+</html>
