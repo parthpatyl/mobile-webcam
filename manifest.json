@@ -1,0 +1,25 @@
+{
+  "name": "Mobile-WebCam",
+  "short_name": "Mobile-WebCam",
+  "description": "Mobile Camera Streaming Client",
+  "start_url": "/mobile_client.html",
+  "display": "standalone",
+  "background_color": "#222222",
+  "theme_color": "#0078d4",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/Icon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/Icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
+

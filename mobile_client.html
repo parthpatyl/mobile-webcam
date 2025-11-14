@@ -114,6 +114,53 @@
         let rotation = 0;
         let flipH = false;
         let flipV = false;
+        let streaming = false;
+        let lastVideoWidth = 0;
+        let lastVideoHeight = 0;
+        let currentStream = null;
+        let orientationCheckInterval = null;
+        let isTransitioning = false;
+        let dimensionChangeCount = 0;
+        let stableDimensionCount = 0;
+        const REQUIRED_STABLE_FRAMES = 3; // Wait for 3 frames with same dimensions before sending
+
+        function checkVideoStreamHealth() {
+            if (!streaming || !currentStream) return false;
+            
+            const videoTrack = currentStream.getVideoTracks()[0];
+            if (!videoTrack) {
+                console.error('No video track found');
+                return false;
+            }
+            
+            if (videoTrack.readyState !== 'live') {
+                console.error(`Video track state: ${videoTrack.readyState}`);
+                return false;
+            }
+            
+            if (!video.videoWidth || !video.videoHeight) {
+                console.warn('Video dimensions not available');
+                return false;
+            }
+            
+            return true;
+        }
+
+        function updateCanvasSize() {
+            if (!video.videoWidth || !video.videoHeight) {
+                return false;
+            }
+            
+            if (video.videoWidth !== canvas.width || video.videoHeight !== canvas.height) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                lastVideoWidth = video.videoWidth;
+                lastVideoHeight = video.videoHeight;
+                console.log(`Canvas resized: ${canvas.width}x${canvas.height}`);
+                return true;
+            }
+            return false;
+        }
 
         async function startStream() {
             const SERVER_IP = prompt("Enter PC IP (e.g., 192.168.1.100):", "10.25.94.185");
@@ -131,23 +178,85 @@
                     },
                     audio: false
                 });
+                currentStream = stream;
                 video.srcObject = stream;
 
                 // Wait for video to load
-                await new Promise(resolve => {
-                    video.onloadedmetadata = resolve;
+                await new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Video metadata load timeout'));
+                    }, 5000);
+                    
+                    video.onloadedmetadata = () => {
+                        clearTimeout(timeout);
+                        resolve();
+                    };
+                    
+                    video.onerror = (e) => {
+                        clearTimeout(timeout);
+                        reject(new Error('Video load error'));
+                    };
                 });
 
                 // Set canvas size to match actual video dimensions
                 // This adapts to device orientation automatically
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
+                if (!updateCanvasSize()) {
+                    throw new Error('Failed to get video dimensions');
+                }
                 
-                // Listen for orientation changes and update canvas size
+                // Listen for video resize events
                 video.addEventListener('resize', () => {
-                    canvas.width = video.videoWidth;
-                    canvas.height = video.videoHeight;
+                    if (streaming && checkVideoStreamHealth()) {
+                        updateCanvasSize();
+                    }
                 });
+                
+                // Listen for device orientation changes with retry logic
+                let orientationRetryCount = 0;
+                const maxOrientationRetries = 10;
+                
+                const handleOrientationChange = () => {
+                    isTransitioning = true;
+                    dimensionChangeCount++;
+                    stableDimensionCount = 0;
+                    orientationRetryCount = 0;
+                    console.log('Orientation change detected, pausing frame transmission...');
+                    
+                    const checkOrientation = () => {
+                        if (!streaming || !checkVideoStreamHealth()) {
+                            isTransitioning = false;
+                            return;
+                        }
+                        
+                        if (updateCanvasSize()) {
+                            console.log(`Device orientation changed: ${video.videoWidth}x${video.videoHeight}`);
+                            // Wait a bit for dimensions to stabilize before resuming
+                            setTimeout(() => {
+                                isTransitioning = false;
+                                console.log('Orientation transition complete, resuming stream');
+                            }, 200);
+                            orientationRetryCount = 0;
+                        } else if (orientationRetryCount < maxOrientationRetries) {
+                            orientationRetryCount++;
+                            setTimeout(checkOrientation, 100);
+                        } else {
+                            isTransitioning = false;
+                        }
+                    };
+                    setTimeout(checkOrientation, 100);
+                };
+                
+                window.addEventListener('orientationchange', handleOrientationChange);
+                
+                // Also listen for resize events (works on some devices)
+                window.addEventListener('resize', handleOrientationChange);
+                
+                // Periodic health check for orientation changes
+                orientationCheckInterval = setInterval(() => {
+                    if (streaming && checkVideoStreamHealth()) {
+                        updateCanvasSize();
+                    }
+                }, 500);
 
                 // Connect to WebSocket (use wss:// for secure)
                 ws = new WebSocket(`wss://${SERVER_IP}:8081`);
@@ -155,6 +264,7 @@
                 ws.onopen = () => {
                     statusDiv.textContent = `Status: Connected to ${SERVER_IP}:8081`;
                     document.getElementById('controls').style.display = 'block';
+                    streaming = true;
                     // Send initial rotation/flip settings
                     sendRotationCommand();
                     sendFlipCommand('H', flipH);
@@ -167,7 +277,9 @@
                 };
 
                 ws.onclose = () => {
+                    streaming = false;
                     statusDiv.textContent = "Status: Disconnected";
+                    document.getElementById('controls').style.display = 'none';
                 };
 
             } catch (error) {
@@ -176,32 +288,149 @@
         }
 
         function streamFrames() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-            // Update canvas size if video dimensions changed (orientation change)
-            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
+            if (!streaming || !ws || ws.readyState !== WebSocket.OPEN) {
+                streaming = false;
+                return;
             }
 
-            // Draw video frame to canvas at actual dimensions
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            try {
+                // Check video stream health first
+                if (!checkVideoStreamHealth()) {
+                    console.warn('Video stream health check failed, retrying...');
+                    if (streaming) {
+                        setTimeout(streamFrames, 200);
+                    }
+                    return;
+                }
 
-            // Convert canvas to blob and send
-            canvas.toBlob((blob) => {
-                ws.send(blob);
-                // Send next frame at ~30 FPS
-                setTimeout(streamFrames, 33);
-            }, 'image/jpeg', 0.8);
+                // Don't send frames during orientation transition
+                if (isTransitioning) {
+                    if (streaming) {
+                        setTimeout(streamFrames, 50);
+                    }
+                    return;
+                }
+
+                // Check if dimensions are changing (orientation change in progress)
+                const dimensionsChanged = (video.videoWidth !== lastVideoWidth || video.videoHeight !== lastVideoHeight);
+                
+                if (dimensionsChanged) {
+                    dimensionChangeCount++;
+                    stableDimensionCount = 0;
+                    console.log(`Dimension change detected (${dimensionChangeCount}), updating canvas and waiting for stability...`);
+                    // Update canvas but wait before sending frames
+                    updateCanvasSize();
+                    if (streaming) {
+                        setTimeout(streamFrames, 50);
+                    }
+                    return;
+                } else {
+                    // Dimensions are stable, increment stable counter
+                    stableDimensionCount++;
+                }
+
+                // Only send frames if dimensions have been stable for required frames
+                // This prevents sending mixed-dimension frames during orientation changes
+                if (stableDimensionCount < REQUIRED_STABLE_FRAMES && dimensionChangeCount > 0) {
+                    if (streaming) {
+                        setTimeout(streamFrames, 33);
+                    }
+                    return;
+                }
+
+                // Reset counters once stable
+                if (stableDimensionCount >= REQUIRED_STABLE_FRAMES && dimensionChangeCount > 0) {
+                    console.log(`Dimensions stabilized at ${canvas.width}x${canvas.height}, resuming normal streaming`);
+                    dimensionChangeCount = 0;
+                }
+
+                // Validate canvas dimensions
+                if (canvas.width === 0 || canvas.height === 0) {
+                    console.warn('Invalid canvas dimensions, waiting...');
+                    if (streaming) {
+                        setTimeout(streamFrames, 100);
+                    }
+                    return;
+                }
+
+                // Draw video frame to canvas at actual dimensions
+                if (video.readyState >= 2) { // HAVE_CURRENT_DATA or higher
+                    try {
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    } catch (drawError) {
+                        console.error('Error drawing to canvas:', drawError);
+                        // Canvas might be invalid, try to recover
+                        if (streaming) {
+                            setTimeout(streamFrames, 100);
+                        }
+                        return;
+                    }
+
+                    // Convert canvas to blob and send
+                    canvas.toBlob((blob) => {
+                        if (!blob) {
+                            console.warn('Failed to create blob from canvas');
+                            if (streaming) {
+                                setTimeout(streamFrames, 33);
+                            }
+                            return;
+                        }
+                        
+                        if (streaming && ws && ws.readyState === WebSocket.OPEN) {
+                            try {
+                                ws.send(blob);
+                            } catch (e) {
+                                console.error('Error sending frame:', e);
+                                statusDiv.textContent = `Status: Send Error - ${e.message}`;
+                            }
+                        }
+                        // Continue streaming regardless of errors
+                        if (streaming) {
+                            setTimeout(streamFrames, 33);
+                        }
+                    }, 'image/jpeg', 0.8);
+                } else {
+                    // Video not ready yet, try again soon
+                    if (streaming) {
+                        setTimeout(streamFrames, 100);
+                    }
+                }
+            } catch (error) {
+                console.error('Error in streamFrames:', error);
+                statusDiv.textContent = `Status: Streaming Error - ${error.message}`;
+                // Continue streaming even after error
+                if (streaming) {
+                    setTimeout(streamFrames, 100);
+                }
+            }
         }
 
         function stopStream() {
+            streaming = false;
+            isTransitioning = false;
+            dimensionChangeCount = 0;
+            stableDimensionCount = 0;
+            
+            // Clear orientation check interval
+            if (orientationCheckInterval) {
+                clearInterval(orientationCheckInterval);
+                orientationCheckInterval = null;
+            }
+            
             if (ws) {
                 ws.close();
+                ws = null;
             }
+            
+            if (currentStream) {
+                currentStream.getTracks().forEach(track => track.stop());
+                currentStream = null;
+            }
+            
             if (video.srcObject) {
-                video.srcObject.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
             }
+            
             statusDiv.textContent = "Status: Stopped";
             document.getElementById('controls').style.display = 'none';
         }
@@ -209,12 +438,18 @@
         function updateRotation() {
             rotation = parseInt(document.getElementById('rotation').value);
             sendRotationCommand();
+            statusDiv.textContent = `Status: Rotation set to ${rotation}°`;
         }
         
         function sendRotationCommand() {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                const cmd = JSON.stringify({ action: "rotate", value: rotation });
-                ws.send(cmd);
+                try {
+                    const cmd = JSON.stringify({ action: "rotate", value: rotation });
+                    ws.send(cmd);
+                } catch (e) {
+                    console.error('Error sending rotation command:', e);
+                    statusDiv.textContent = `Status: Error sending rotation - ${e.message}`;
+                }
             }
         }
         
@@ -227,6 +462,7 @@
                 } else {
                     button.classList.remove('active');
                 }
+                statusDiv.textContent = `Status: Horizontal flip ${flipH ? 'ON' : 'OFF'}`;
             } else if (type === 'V') {
                 flipV = !flipV;
                 const button = document.getElementById('flipV');
@@ -235,14 +471,20 @@
                 } else {
                     button.classList.remove('active');
                 }
+                statusDiv.textContent = `Status: Vertical flip ${flipV ? 'ON' : 'OFF'}`;
             }
             sendFlipCommand(type, type === 'H' ? flipH : flipV);
         }
         
         function sendFlipCommand(type, value) {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                const cmd = JSON.stringify({ action: "flip", type: type, value: value });
-                ws.send(cmd);
+                try {
+                    const cmd = JSON.stringify({ action: "flip", type: type, value: value });
+                    ws.send(cmd);
+                } catch (e) {
+                    console.error('Error sending flip command:', e);
+                    statusDiv.textContent = `Status: Error sending flip - ${e.message}`;
+                }
             }
         }
     </script>

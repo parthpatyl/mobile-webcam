@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Mobile-WebCam
+Comment=Start Mobile Camera Streaming Server
+Exec=/media/prth/GameSpace/Sidequest/start_camera_stream.sh
+Icon=/media/prth/GameSpace/Sidequest/Icon.png
+Type=Application
+Terminal=true
+Categories=Network;Video;
+StartupNotify=true
+
